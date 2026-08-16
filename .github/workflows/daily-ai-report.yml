@@ -54,5 +54,6 @@ jobs:
             echo "No report to archive"
           else
             git commit -m "docs: 归档 AI 资讯日报 $(TZ=Asia/Shanghai date +%F)"
-            git push
+            # detached HEAD 下必须显式指定分支: HEAD:<branch>
+            git push origin HEAD:${{ github.ref_name }}
           fi
