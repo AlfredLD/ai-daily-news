@@ -49,6 +49,8 @@ import hashlib
 import hmac
 import json
 import os
+import re
+import subprocess
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
@@ -63,8 +65,10 @@ import requests
 FEISHU_WEBHOOK = os.environ.get("FEISHU_WEBHOOK", "").strip()
 FEISHU_SECRET = os.environ.get("FEISHU_SECRET", "").strip()
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "").strip()
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com/v1").strip().rstrip("/")
-LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-chat").strip()
+# 注意: workflow 通过 secrets 传值时, 未配置的 secret 会展开为空字符串,
+# 空串会覆盖默认值导致 LLM 请求失败, 故用 `or` 回退到默认值
+LLM_BASE_URL = (os.environ.get("LLM_BASE_URL", "") or "https://api.deepseek.com/v1").strip().rstrip("/")
+LLM_MODEL = (os.environ.get("LLM_MODEL", "") or "deepseek-chat").strip()
 LLM_BACKUP_API_KEY = os.environ.get("LLM_BACKUP_API_KEY", "").strip()
 LLM_BACKUP_BASE_URL = os.environ.get("LLM_BACKUP_BASE_URL", "").strip().rstrip("/")
 LLM_BACKUP_MODEL = os.environ.get("LLM_BACKUP_MODEL", "").strip()
@@ -240,6 +244,25 @@ def log(msg):
     print(f"[{beijing_now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
 
+def _mask_key(k):
+    """脱敏显示 API Key(前4后4, 中间打码)"""
+    if not k:
+        return "(未配置)"
+    if len(k) <= 8:
+        return "***"
+    return k[:4] + "****" + k[-4:]
+
+
+def _clean_html(text):
+    """清洗 HTML 标签与纯链接, 压缩空白, 返回纯文本(可能为空串)"""
+    if not text:
+        return ""
+    text = re.sub(r"<[^>]+>", " ", text)          # 去 HTML 标签
+    text = re.sub(r"https?://\S+", "", text)       # 去纯链接
+    text = re.sub(r"&nbsp;|&amp;|&lt;|&gt;|&#\d+;", " ", text)  # 去实体
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def fetch_with_retry(url, headers=None, params=None, timeout=REQUEST_TIMEOUT,
                      retries=RETRY_TIMES):
     """带指数退避重试的 GET 请求, 成功返回 requests.Response, 失败返回 None"""
@@ -336,14 +359,14 @@ def parse_feed_entries(content, feed_name, need_filter, source_name,
         else:
             link = (entry.findtext("link") or "").strip()
 
-        # 摘要/描述
+        # 摘要/描述(清洗 HTML 标签与纯链接, 避免出现"只甩一条链接"的摘要)
         summary = ""
         desc_elem = (entry.find(ATOM_NS + "summary") if is_atom
                      else entry.find("description"))
         if desc_elem is None and is_atom:
             desc_elem = entry.find(ATOM_NS + "content")
         if desc_elem is not None and desc_elem.text:
-            summary = " ".join(desc_elem.text.split())[:400]
+            summary = _clean_html(desc_elem.text)[:400]
 
         # 发布时间
         if is_atom:
@@ -728,11 +751,24 @@ LLM_PROMPT_RULES = """处理规则:
 
 
 def _call_llm(base_url, api_key, model, prompt):
-    """调用 LLM(OpenAI 兼容格式), 返回 items 列表或 None"""
+    """调用 LLM(OpenAI 兼容格式), 返回 items 列表或 None
+    容错: key 缺失 / 401(密钥无效) / 400(参数不支持→去 response_format 重试) / 404(URL错误)"""
+    if not api_key:
+        log(f"  LLM({model}) 未配置 API Key, 无法调用(请在 GitHub Secrets 配置 LLM_API_KEY)")
+        return None
+    if not base_url:
+        log(f"  LLM({model}) 未配置 Base URL")
+        return None
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
+
+    def _post(body):
+        resp = requests.post(f"{base_url}/chat/completions",
+                             headers=headers, json=body, timeout=180)
+        return resp
+
     body = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
@@ -741,16 +777,40 @@ def _call_llm(base_url, api_key, model, prompt):
         "response_format": {"type": "json_object"},
     }
     try:
-        resp = requests.post(f"{base_url}/chat/completions",
-                             headers=headers, json=body, timeout=180)
-        if resp.status_code != 200:
-            log(f"  LLM({model}) HTTP {resp.status_code}: {resp.text[:300]}")
+        resp = _post(body)
+    except requests.exceptions.Timeout:
+        log(f"  LLM({model}) 请求超时(>180s), 请检查网络或换用备用模型")
+        return None
+    except Exception as e:
+        log(f"  LLM({model}) 请求异常: {e}")
+        return None
+
+    # 部分 OpenAI 兼容服务不支持 response_format, 返回 400 时去掉它重试一次
+    if resp.status_code == 400 and "response_format" in body:
+        log(f"  LLM({model}) HTTP 400(可能不支持 response_format), 去掉后重试")
+        body.pop("response_format", None)
+        try:
+            resp = _post(body)
+        except Exception as e:
+            log(f"  LLM({model}) 重试异常: {e}")
             return None
+
+    if resp.status_code == 401:
+        log(f"  LLM({model}) HTTP 401: API Key 无效或已过期, 请检查 LLM_API_KEY")
+        return None
+    if resp.status_code == 404:
+        log(f"  LLM({model}) HTTP 404: Base URL 或模型名错误, 请检查 LLM_BASE_URL/LLM_MODEL")
+        return None
+    if resp.status_code != 200:
+        log(f"  LLM({model}) HTTP {resp.status_code}: {resp.text[:300]}")
+        return None
+
+    try:
         content = resp.json()["choices"][0]["message"]["content"]
         data = json.loads(content)
         return data.get("items", [])
     except Exception as e:
-        log(f"  LLM({model}) 调用异常: {e}")
+        log(f"  LLM({model}) 返回解析异常: {e}")
         return None
 
 
@@ -793,7 +853,8 @@ def summarize_with_llm(items, is_supplement=False):
 
 
 def fallback_format(items):
-    """LLM 全部失败时的降级: 规则整理(标题保持原文, 标注未翻译, 补通用 reason)"""
+    """LLM 全部失败时的降级: 规则整理 + 清洗(去HTML/去纯链接/空摘要兜底)
+    注意: 无 LLM 无法翻译, 标题/摘要保持原始语言, 需在日报页脚明确告知读者"""
     result = []
     for it in items:
         source_type = it.get("source_type", "unverified")
@@ -803,10 +864,15 @@ def fallback_format(items):
             category = "research"
         else:
             category = "industry"
+        # 清洗标题与摘要(去HTML标签/纯链接/实体)
+        title = _clean_html(it["title"]) or "（无标题）"
+        summary = _clean_html(it["summary"])
+        if not summary:
+            summary = "原文未提供摘要，请点击来源链接查看详情。"
         result.append({
-            "title": it["title"],
-            "summary": it["summary"][:150] if it["summary"] else "无摘要",
-            "reason": "LLM 服务不可用, 暂未生成关注理由; 请参阅摘要与原文链接判断重要性。",
+            "title": title,
+            "summary": summary[:200],
+            "reason": "AI 智能整理服务暂不可用，本条为原始采集内容（未经翻译与分级），请参阅摘要与来源链接自行判断。",
             "category": category,
             "priority": "normal",
             "source_label": it["source"] + ("（间接获取）" if it.get("indirect") else ""),
@@ -1016,6 +1082,46 @@ def save_report_file(md_text, iso_label, is_supplement=False):
         return None
 
 
+def commit_reports_to_repo(iso_label):
+    """把 reports/ 目录 commit 并 push 到 GitHub 仓库, 使归档链接立即生效。
+    修复点: GitHub Actions 的 checkout 处于 detached HEAD, 裸 `git push` 会报
+    "You are not currently on a branch", 必须用 `git push origin HEAD:<branch>`。
+    仅在 GitHub Actions 环境(GITHUB_TOKEN 存在)执行; 失败不阻塞飞书推送。"""
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    if not (token and repo):
+        log("  非 GitHub Actions 环境(无 GITHUB_TOKEN), 跳过自动归档")
+        return
+
+    branch = os.environ.get("GITHUB_REF_NAME", "").strip() or "main"
+
+    def _run(cmd):
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True)
+        except FileNotFoundError:
+            log("  未找到 git 命令, 跳过自动归档")
+            return None
+
+    _run(["git", "config", "user.name", "github-actions[bot]"])
+    _run(["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"])
+
+    r = _run(["git", "add", "reports/"])
+    if r is None:
+        return
+    r = _run(["git", "diff", "--cached", "--quiet"])
+    if r is not None and r.returncode == 0:
+        log("  无新归档文件, 跳过 commit/push")
+        return
+
+    _run(["git", "commit", "-m", f"docs: 归档 AI 资讯日报 {iso_label}"])
+    r = _run(["git", "push", "origin", f"HEAD:{branch}"])
+    if r is not None and r.returncode == 0:
+        log(f"  日报已归档并 push 到 {branch}")
+    else:
+        err = (r.stderr if r else "")[:300]
+        log(f"  push 失败(归档链接可能暂时 404): {err}")
+
+
 # ---------------------------------------------------------------------------
 # 主函数
 # ---------------------------------------------------------------------------
@@ -1026,8 +1132,15 @@ def main():
         log("错误: 未配置 FEISHU_WEBHOOK")
         return {"code": 1, "msg": "FEISHU_WEBHOOK 未配置"}
     if not LLM_API_KEY:
-        log("错误: 未配置 LLM_API_KEY")
-        return {"code": 1, "msg": "LLM_API_KEY 未配置"}
+        log("错误: 未配置 LLM_API_KEY, 将无法调用 LLM 生成中文日报(可用规则降级)")
+        # 不直接退出: 仍采集并尝试规则降级, 但会提示
+
+    # LLM 配置自检(脱敏)
+    log(f"LLM 主模型: {LLM_MODEL} @ {LLM_BASE_URL} (key: {_mask_key(LLM_API_KEY)})")
+    if LLM_BACKUP_API_KEY:
+        log(f"LLM 备用模型: {LLM_BACKUP_MODEL} @ {LLM_BACKUP_BASE_URL} (key: {_mask_key(LLM_BACKUP_API_KEY)})")
+    else:
+        log("未配置备用 LLM, 主模型失败时将使用规则降级")
 
     # 时间窗口: 前一天 00:00:00 ~ 当天 00:00:00 (北京时间)
     now = beijing_now()
@@ -1046,7 +1159,7 @@ def main():
     if items:
         structured = summarize_with_llm(items)
         if structured is None:
-            log("LLM 全部失败(主+备用), 使用规则降级")
+            log("LLM 全部失败(主+备用), 使用规则降级(注意: 降级输出为原始采集, 可能含英文)")
             structured = fallback_format(items)
     else:
         structured = []
@@ -1054,6 +1167,8 @@ def main():
     report = build_report_md(structured, indirect_map, failed,
                              cover_label_cn, iso_label)
     save_report_file(report, iso_label)
+    # 先归档 commit+push 到仓库, 再推送卡片, 保证归档链接立即有效
+    commit_reports_to_repo(iso_label)
     card_title = f"📰 AI资讯日报 | {cover_label_cn}"
     ok = send_md_to_feishu(report, card_title)
     log("首轮日报推送" + ("成功" if ok else "失败"))
@@ -1080,6 +1195,7 @@ def main():
         supp_report = build_report_md(structured, supp_indirect_full, still_failed,
                                       cover_label_cn, iso_label, is_supplement=True)
         save_report_file(supp_report, iso_label, is_supplement=True)
+        commit_reports_to_repo(iso_label)
         ok2 = send_md_to_feishu(supp_report, f"📰 AI资讯日报补充更新 | {cover_label_cn}")
         log("补充更新推送" + ("成功" if ok2 else "失败"))
 
