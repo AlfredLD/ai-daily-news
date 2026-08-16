@@ -1,32 +1,37 @@
-name: Daily AI News Report
+name: Daily AI Report
 
 on:
   schedule:
+    # GitHub Actions cron 使用 UTC 时区
     # UTC 01:00 = 北京时间 09:00
-    # GitHub Actions cron 使用 UTC 时区, 5 段格式: 分 时 日 月 周
     - cron: '0 1 * * *'
-  # 允许手动触发(用于测试)
-  workflow_dispatch:
+  workflow_dispatch: {}   # 支持手动触发测试
+
+permissions:
+  contents: write   # 允许把日报归档提交到仓库
+
+concurrency:
+  group: daily-ai-report
+  cancel-in-progress: false
 
 jobs:
-  daily-report:
+  report:
     runs-on: ubuntu-latest
-    # 超时 45 分钟: 30 分钟重采等待 + 采集处理时间
-    timeout-minutes: 45
-
+    timeout-minutes: 45   # 覆盖 30 分钟失败源重采等待
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: 'pip'
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run AI Daily Report
+      - name: Generate and push AI daily report
         env:
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
           FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
@@ -36,6 +41,18 @@ jobs:
           LLM_BACKUP_API_KEY: ${{ secrets.LLM_BACKUP_API_KEY }}
           LLM_BACKUP_BASE_URL: ${{ secrets.LLM_BACKUP_BASE_URL }}
           LLM_BACKUP_MODEL: ${{ secrets.LLM_BACKUP_MODEL }}
-          # GITHUB_TOKEN 由 GitHub Actions 自动提供, 无需手动配置
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python ai_daily_report.py
+
+      - name: Archive report to repo
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add reports/ 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No report to archive"
+          else
+            git commit -m "docs: 归档 AI 资讯日报 $(TZ=Asia/Shanghai date +%F)"
+            git push
+          fi
