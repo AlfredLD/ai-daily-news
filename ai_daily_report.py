@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-每日 AI 资讯日报 - GitHub Actions 版 v4
+每日 AI 资讯日报 - GitHub Actions 版 v5
 ========================================
 GitHub Actions 定时触发, 每天 09:00(北京时间)执行:
   1. 采集过去 24 小时 AI 领域资讯(30 个信息源, 覆盖国内外)
   2. 调用 LLM API 做中文摘要、去重、重要性分级(主模型+备用模型自动切换)
-  3. 生成标准 Markdown 日报(结构清晰、层次分明、全简体中文,
-     公司名/模型名/参数保留原文)
-  4. 通过飞书群机器人 Webhook 以交互卡片(支持 Markdown 渲染)推送
+     —— 强制全简体中文输出(仅公司名/模型名/参数保留原文), 每条必出"关注理由"
+  3. 生成标准 Markdown 日报(四大板块, 每板块≤20条, 按优先级排序, 高优先级🔴前缀)
+  4. 通过飞书群机器人 Webhook 以【单张交互卡片】推送完整文档(不再分片为多条消息)
   5. 日报同时归档为 reports/AI资讯日报_YYYY-MM-DD.md 并提交到仓库
   6. 真正采集失败的源等待 30 分钟后重采, 推送"补充更新"
 
@@ -82,6 +82,10 @@ RETRY_WAIT_SECONDS = 1800         # 失败源重采等待时间(30分钟)
 
 # 飞书卡片限制: 单个 markdown 元素内容安全上限(字符)
 CARD_CHUNK_CHARS = 3600
+# 每个板块最多保留条数(用户要求各≤20)
+MAX_PER_CATEGORY = 20
+# 单张卡片内容上限(飞书交互卡片 markdown 元素约 30KB, 留余量)
+CARD_CONTENT_LIMIT = 29000
 
 # AI 关键词(用于综合媒体过滤)
 AI_KEYWORDS = [
@@ -692,24 +696,35 @@ def retry_failed_sources(failed_names, start_date, end_date):
 # LLM 摘要与分级(主模型 + 备用模型自动切换)
 # ---------------------------------------------------------------------------
 LLM_PROMPT_RULES = """处理规则:
-1. 合并同一事件的多方报道为一条; 被合并的多个来源名用 " / " 连接放入 source_label 字段(如 "36氪 / TechCrunch / The Verge")
-2. 过滤低价值信息(纯营销软文、无实质内容的转发、与AI无关的内容)
-3. 每条消息输出以下字段:
-   - title: 用简体中文概括事件标题; 公司名、产品名、模型名、技术术语保留英文原文
-     (示例: "OpenAI年化营收突破400亿美元"、"智谱发布GLM-5.3"、"GPT-5.6 Sol输出速度达750 tokens/秒")
-   - summary: 2-3句简体中文摘要, 提炼核心要点(数字、模型名、参数保留原文)
+
+【语言要求 — 最高优先级, 必须严格遵守】
+1. 标题、摘要、关注理由全部必须用简体中文呈现, 无论原始报道是中文还是英文, 都必须翻译/改写为简体中文
+2. 仅以下内容允许保留原文: 公司名(OpenAI/Anthropic/Google/ Meta/NVIDIA)、产品名(ChatGPT/Claude/Gemini)、
+   模型名(GPT-5/Llama-4/GLM-5/DeepSeek-V4)、技术术语(Transformer/RAG/RLHF)、参数与数字(175B/700B/4万亿)
+3. 严禁出现整句英文标题或整段英文摘要; 必要的英文术语须用中文语境包裹
+   正确: "OpenAI 发布 GPT-5.6, Sol 模式输出速度达 750 tokens/秒"
+   错误: "OpenAI announces GPT-5.6 with Sol mode" (整句英文, 禁止)
+
+【合并与筛选】
+4. 同一事件的多方报道合并为一条; 被合并来源用 " / " 连接放入 source_label (如 "36氪 / TechCrunch / The Verge")
+5. 过滤低价值内容(纯营销软文、无实质转发、与AI无关)
+6. 每个板块最多保留 20 条, 且必须挑选当天最值得关注的内容; 宁可少而精, 不要多而杂
+
+【每条消息字段 — reason 为必填, 不可省略】
+   - title: 简体中文标题, 简明扼要概括事件
+   - summary: 2-4 句简体中文摘要, 提炼核心要点(关键数字、模型名、参数保留原文)
+   - reason: 简体中文"关注理由", 1-2 句, 说明这条信息为什么值得关注(行业影响/技术突破/商业意义)
    - category: industry(行业新闻) / research(研究进展) / business(商业化动态) / github(GitHub与开源动态)
    - priority: high(重大事件) / medium(较重要) / normal(常规)
-   - source_label: 来源名称(简体中文优先, 媒体名保留原名, 多来源用 " / " 连接)
-   - source_type: official(官方公告) / media(权威媒体报道) / academic(学术平台) / community(社区动态) / unverified(待核实)
-     —— 直接沿用输入条目的 source_type; 若来源为聚合索引但内容引自官方, 标 official 并在 source_label 中注明
+   - source_label: 来源名(简体中文优先, 国际媒体名保留原名, 多来源用 " / " 连接)
+   - source_type: official / media / academic / community / unverified
+     直接沿用输入条目 source_type; 若聚合索引但内容引自官方, 标 official 并在 source_label 注明
    - url: 信息最全的一条原文链接
-   - reason: 仅 priority=high 时输出, 简体中文说明为什么需要重点关注
-4. 输出保持信息量, 高质量消息优先; 总条数控制在 45 条以内
 
-只输出JSON, 格式: {"items": [{"title": "...", "summary": "...", "category": "...",
-"priority": "...", "source_label": "...", "source_type": "...", "url": "...", "reason": "..."}]}
-不要输出任何其他文字。"""
+【输出格式】
+严格输出 JSON, 不要输出任何其他文字, 不要使用 markdown 代码块标记:
+{"items": [{"title": "...", "summary": "...", "reason": "...", "category": "...",
+"priority": "...", "source_label": "...", "source_type": "...", "url": "..."}]}"""
 
 
 def _call_llm(base_url, api_key, model, prompt):
@@ -722,7 +737,7 @@ def _call_llm(base_url, api_key, model, prompt):
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3,
-        "max_tokens": 8000,
+        "max_tokens": 8192,
         "response_format": {"type": "json_object"},
     }
     try:
@@ -778,7 +793,7 @@ def summarize_with_llm(items, is_supplement=False):
 
 
 def fallback_format(items):
-    """LLM 全部失败时的降级: 规则整理(标题保持原文, 不翻译)"""
+    """LLM 全部失败时的降级: 规则整理(标题保持原文, 标注未翻译, 补通用 reason)"""
     result = []
     for it in items:
         source_type = it.get("source_type", "unverified")
@@ -791,6 +806,7 @@ def fallback_format(items):
         result.append({
             "title": it["title"],
             "summary": it["summary"][:150] if it["summary"] else "无摘要",
+            "reason": "LLM 服务不可用, 暂未生成关注理由; 请参阅摘要与原文链接判断重要性。",
             "category": category,
             "priority": "normal",
             "source_label": it["source"] + ("（间接获取）" if it.get("indirect") else ""),
@@ -818,12 +834,15 @@ SOURCE_TYPE_MAP = {
 }
 
 
-def _fmt_item(idx, it, high=False):
-    """格式化单条消息(与样例一致: 加粗标题 + 缩进要点)"""
-    lines = [f"{idx}. **{it['title']}**"]
+def _fmt_item(idx, it):
+    """格式化单条消息: 加粗标题(高优先级加🔴) + 摘要 + 关注理由 + 来源超链接"""
+    priority = it.get("priority", "normal")
+    marker = "🔴 " if priority == "high" else ""
+    lines = [f"{idx}. {marker}**{it['title']}**"]
     lines.append(f"   - 摘要：{it['summary']}")
-    if high and it.get("reason"):
-        lines.append(f"   - 关注理由：{it['reason']}")
+    reason = it.get("reason")
+    if reason:
+        lines.append(f"   - 关注理由：{reason}")
     label = it.get("source_label") or it.get("source", "未知来源")
     url = it.get("url", "")
     rating = SOURCE_TYPE_MAP.get(it.get("source_type"), "待核实")
@@ -834,28 +853,32 @@ def _fmt_item(idx, it, high=False):
     return "\n".join(lines)
 
 
+def _archive_url(iso_label):
+    """构造今日日报在 GitHub 仓库的归档链接(在 Actions 环境中可用)"""
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    if not repo:
+        return ""
+    server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+    branch = os.environ.get("GITHUB_REF_NAME", "") or "main"
+    filename = quote(f"AI资讯日报_{iso_label}.md")
+    return f"{server}/{repo}/raw/{branch}/reports/{filename}"
+
+
 def build_report_md(items, indirect_map, failed, cover_label_cn, iso_label,
                     is_supplement=False):
-    """生成标准 Markdown 日报文档(结构对齐用户样例)"""
+    """生成标准 Markdown 日报文档(四大板块, 每板块≤20条, 每条带关注理由)"""
     title = ("📰 AI资讯日报补充更新" if is_supplement else "📰 AI资讯日报") + f" | {cover_label_cn}"
     lines = [f"# {title}", ""]
-
-    high_items = [it for it in items if it.get("priority") == "high"]
-    normal_items = [it for it in items if it.get("priority") != "high"]
-
-    # 高优先级置顶
-    lines.append("## 🔴 高优先级关注")
-    lines.append("")
-    if high_items:
-        for i, it in enumerate(high_items, 1):
-            lines.append(_fmt_item(i, it, high=True))
-    else:
-        lines.append("今日无高优先级事项")
+    lines.append(f"> 数据覆盖：{cover_label_cn} 00:00-24:00 ｜ 信息源：{len(SOURCES) + 4} 个"
+                 f"（官方博客 / 权威媒体 / 学术平台 / 社区）")
     lines.append("")
 
-    # 四大板块
+    # 四大板块: 每板块按优先级排序, 截断至 MAX_PER_CATEGORY 条
+    priority_order = {"high": 0, "medium": 1, "normal": 2}
     for cat_key, cat_title in CATEGORY_MAP:
-        cat_items = [it for it in normal_items if it.get("category") == cat_key]
+        cat_items = [it for it in items if it.get("category") == cat_key]
+        cat_items.sort(key=lambda x: priority_order.get(x.get("priority", "normal"), 2))
+        cat_items = cat_items[:MAX_PER_CATEGORY]
         lines.append("---")
         lines.append("")
         lines.append(cat_title)
@@ -891,11 +914,11 @@ def build_report_md(items, indirect_map, failed, cover_label_cn, iso_label,
     # 页脚
     lines.append("---")
     lines.append("")
-    lines.append(f"📅 **数据覆盖**：{cover_label_cn} 00:00-24:00")
-    lines.append("")
-    lines.append(f"📡 **信息源**：{len(SOURCES) + 4} 个（官方博客/权威媒体/学术平台/社区）")
-    lines.append("")
-    lines.append("🤖 **由 GitHub Actions 自动生成并发送**")
+    archive = _archive_url(iso_label)
+    if archive:
+        lines.append(f"📄 完整 Markdown 归档：[{archive}]({archive})")
+        lines.append("")
+    lines.append("🤖 由 GitHub Actions 自动生成并发送")
     return "\n".join(lines)
 
 
@@ -947,34 +970,33 @@ def chunk_markdown(md_text, limit=CARD_CHUNK_CHARS):
 
 
 def send_md_to_feishu(md_text, card_title):
-    """以多张交互卡片推送 Markdown 文档(卡片内 markdown 元素渲染);
-    卡片全部失败时降级为纯文本消息"""
-    chunks = chunk_markdown(md_text)
-    log(f"  日报将分 {len(chunks)} 张卡片推送(共 {len(md_text)} 字符)")
-
-    all_ok = True
-    for i, chunk in enumerate(chunks):
-        elements = [{"tag": "markdown", "content": chunk}]
-        card = {"config": {"wide_screen_mode": True}, "elements": elements}
-        if i == 0:
-            card["header"] = {
-                "title": {"tag": "plain_text", "content": card_title[:48]},
-                "template": "blue",
-            }
-        ok, _ = _post_feishu({"msg_type": "interactive", "card": card})
-        if not ok:
-            all_ok = False
-        time.sleep(1)
-
-    if not all_ok:
-        # 降级: 纯文本(损失排版但保证送达)
-        log("  卡片推送存在失败, 降级为纯文本补发")
-        text = md_text[:28000]
-        if len(md_text) > 28000:
-            text += "\n\n...(内容过长, 已截断)"
-        ok, _ = _post_feishu({"msg_type": "text", "content": {"text": text}})
-        return ok
-    return True
+    """以单张交互卡片推送完整 Markdown 文档(不再分片为多条消息);
+    内容超限则截断并提示见仓库归档; 卡片失败时降级纯文本"""
+    log(f"  推送单张卡片(共 {len(md_text)} 字符)")
+    content = md_text
+    if len(content) > CARD_CONTENT_LIMIT:
+        content = content[:CARD_CONTENT_LIMIT] + \
+            "\n\n...(内容过长已截断, 完整内容见仓库 reports/ 目录归档)"
+        log(f"  内容超限, 截断至 {CARD_CONTENT_LIMIT} 字符")
+    elements = [{"tag": "markdown", "content": content}]
+    card = {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": card_title[:48]},
+            "template": "blue",
+        },
+        "elements": elements,
+    }
+    ok, _ = _post_feishu({"msg_type": "interactive", "card": card})
+    if ok:
+        return True
+    # 降级: 纯文本(损失排版但保证送达)
+    log("  单卡片推送失败, 降级为纯文本")
+    text = md_text[:28000]
+    if len(md_text) > 28000:
+        text += "\n\n...(内容过长, 已截断)"
+    ok, _ = _post_feishu({"msg_type": "text", "content": {"text": text}})
+    return ok
 
 
 def save_report_file(md_text, iso_label, is_supplement=False):
