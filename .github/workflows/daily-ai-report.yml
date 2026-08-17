@@ -3,8 +3,9 @@ name: Daily AI Report
 on:
   schedule:
     # GitHub Actions cron 使用 UTC 时区
-    # UTC 01:00 = 北京时间 09:00
-    - cron: '0 1 * * *'
+    # UTC 01:15 = 北京时间 09:15
+    # 避开整点(00:00/01:00 高负载易延迟或漏触发), 9:15 更稳定
+    - cron: '15 1 * * *'
   workflow_dispatch: {}   # 支持手动触发测试
 
 permissions:
