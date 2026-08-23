@@ -2,7 +2,7 @@
 """
 每日 AI 资讯日报 - GitHub Actions 版 v5
 ========================================
-GitHub Actions 定时触发, 每天 09:00(北京时间)执行:
+GitHub Actions 定时触发, 每天 09:15(北京时间)执行:
   1. 采集过去 24 小时 AI 领域资讯(30 个信息源, 覆盖国内外)
   2. 调用 LLM API 做中文摘要、去重、重要性分级(主模型+备用模型自动切换)
      —— 强制全简体中文输出(仅公司名/模型名/参数保留原文), 每条必出"关注理由"
@@ -772,8 +772,8 @@ def _call_llm(base_url, api_key, model, prompt):
     body = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3,
-        "max_tokens": 8192,
+        "temperature": 0.1,
+        "max_tokens": 16000,
         "response_format": {"type": "json_object"},
     }
     try:
@@ -807,20 +807,99 @@ def _call_llm(base_url, api_key, model, prompt):
 
     try:
         content = resp.json()["choices"][0]["message"]["content"]
-        data = json.loads(content)
-        return data.get("items", [])
     except Exception as e:
-        log(f"  LLM({model}) 返回解析异常: {e}")
+        log(f"  LLM({model}) 响应结构异常: {e}; body 前 200 字符: {resp.text[:200]}")
         return None
+
+    items = _try_parse_json_items(content, model)
+    if items is None:
+        return None
+    return items
+
+
+def _try_parse_json_items(content, model):
+    """4 级健壮解析 LLM 返回内容, 提取 items 列表。
+    1) 直接 json.loads (首选)
+    2) 提取 ```json ... ``` 围栏
+    3) 截取首个 {...} 对象再解析
+    4) 尝试补齐未闭合字符串(极端兜底, 截断时常见)
+    """
+    if content is None:
+        log(f"  LLM({model}) 返回内容为空")
+        return None
+    # 打印诊断(只前 500 字符, 避免日志爆炸)
+    head = content[:500].replace("\n", " ")
+    log(f"  LLM({model}) 响应诊断: {len(content)} 字符, {content.count(chr(10)) + 1} 行 | 头部: {head}…")
+
+    # 第 1 级: 直接解析
+    try:
+        data = json.loads(content)
+        if isinstance(data, dict) and "items" in data:
+            return data["items"]
+        if isinstance(data, list):
+            return data
+    except json.JSONDecodeError as e:
+        log(f"  LLM({model}) 直接 JSON 解析失败: {e}; 尝试围栏提取")
+
+    # 第 2 级: 提取 ```json ... ``` 围栏
+    fence_match = re.search(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", content, re.DOTALL)
+    if fence_match:
+        try:
+            data = json.loads(fence_match.group(1))
+            log(f"  LLM({model}) 围栏提取成功")
+            if isinstance(data, dict) and "items" in data:
+                return data["items"]
+            if isinstance(data, list):
+                return data
+        except json.JSONDecodeError as e:
+            log(f"  LLM({model}) 围栏解析失败: {e}; 尝试首对象截取")
+
+    # 第 3 级: 截取首个 {...} 块
+    first_brace = content.find("{")
+    last_brace = content.rfind("}")
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        candidate = content[first_brace:last_brace + 1]
+        try:
+            data = json.loads(candidate)
+            log(f"  LLM({model}) 首对象截取成功")
+            if isinstance(data, dict) and "items" in data:
+                return data["items"]
+            if isinstance(data, list):
+                return data
+        except json.JSONDecodeError as e:
+            log(f"  LLM({model}) 首对象解析失败: {e}; 尝试 raw_decode")
+
+    # 第 4 级: raw_decode (跳过前导非 JSON 内容, 找到首个合法 JSON 起点)
+    decoder = json.JSONDecoder()
+    for start_idx in range(min(50, len(content))):
+        for off in range(start_idx, min(start_idx + 5, len(content))):
+            ch = content[off]
+            if ch in "{[":
+                try:
+                    obj, end = decoder.raw_decode(content[off:])
+                    if isinstance(obj, dict) and "items" in obj:
+                        log(f"  LLM({model}) raw_decode 成功(offset={off})")
+                        return obj["items"]
+                    if isinstance(obj, list):
+                        log(f"  LLM({model}) raw_decode 成功(offset={off}, 列表)")
+                        return obj
+                except json.JSONDecodeError:
+                    pass
+
+    log(f"  LLM({model}) 4 级解析全部失败, 无法提取 items")
+    return None
 
 
 def summarize_with_llm(items, is_supplement=False):
-    """调用 LLM 做中文摘要/去重/分级, 自动主→备用切换, 返回结构化列表或 None"""
+    """调用 LLM 做中文摘要/去重/分级, 自动主→备用切换, 返回结构化列表或 None
+    输入压缩: summary≤100 字符, 让 prompt 更短、LLM 输出更稳定, 避免超过
+    16k token 截断导致 JSON 不闭合。url 仍保留(LLM 合并多源时需选最佳链接)。
+    """
     payload_items = [
-        {"title": it["title"], "summary": it["summary"][:200],
-         "source": it["source"], "url": it["url"],
-         "source_type": it.get("source_type", "unverified"),
-         "indirect": bool(it.get("indirect"))}
+        {"title": it["title"][:200],
+         "summary": it["summary"][:100],
+         "source": it["source"],
+         "url": it.get("url", "")}
         for it in items
     ]
 
