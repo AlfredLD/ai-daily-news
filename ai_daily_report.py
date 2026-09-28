@@ -806,7 +806,13 @@ def _call_llm(base_url, api_key, model, prompt):
         return None
 
     try:
-        content = resp.json()["choices"][0]["message"]["content"]
+        choice = resp.json()["choices"][0]
+        content = choice["message"]["content"]
+        finish = choice.get("finish_reason", "?")
+        if finish != "stop":
+            # length = 输出被 max_tokens 硬截断, 是 JSON 不闭合的头号原因
+            log(f"  LLM({model}) finish_reason={finish}" +
+                ("(输出被 max_tokens 截断!)" if finish == "length" else ""))
     except Exception as e:
         log(f"  LLM({model}) 响应结构异常: {e}; body 前 200 字符: {resp.text[:200]}")
         return None
@@ -886,12 +892,36 @@ def _try_parse_json_items(content, model):
                 except json.JSONDecodeError:
                     pass
 
-    log(f"  LLM({model}) 4 级解析全部失败, 无法提取 items")
+    # 第 5 级: 截断恢复 — 定位 "items" 数组, 逐对象 raw_decode, 在截断点收束
+    # 场景: 输出超过 max_tokens 被 API 硬截断, JSON 尾部不完整, 但头部已有 N 条完整
+    # item; 4 级整体解析必然失败, 逐对象解析可以把完整部分全部救回
+    arr_match = re.search(r'"items"\s*:\s*\[', content)
+    if arr_match:
+        recovered = []
+        idx = arr_match.end()
+        dec = json.JSONDecoder()
+        while idx < len(content):
+            while idx < len(content) and content[idx] in " \t\r\n,":
+                idx += 1
+            if idx >= len(content) or content[idx] != "{":
+                break
+            try:
+                obj, end = dec.raw_decode(content, idx)
+            except json.JSONDecodeError:
+                break  # 到达截断点/残缺对象, 停止
+            if isinstance(obj, dict) and obj.get("title"):
+                recovered.append(obj)
+            idx = end
+        if recovered:
+            log(f"  LLM({model}) 截断恢复: 从残缺 JSON 救回 {len(recovered)} 条完整 item")
+            return recovered
+
+    log(f"  LLM({model}) 5 级解析全部失败, 无法提取 items")
     return None
 
 
-def summarize_with_llm(items, is_supplement=False):
-    """调用 LLM 做中文摘要/去重/分级, 自动主→备用切换, 返回结构化列表或 None
+def _summarize_one_batch(batch, is_supplement=False, tag=""):
+    """单批调用 LLM(主→备用自动切换), 返回结构化列表或 None
     输入压缩: summary≤100 字符, 让 prompt 更短、LLM 输出更稳定, 避免超过
     16k token 截断导致 JSON 不闭合。url 仍保留(LLM 合并多源时需选最佳链接)。
     """
@@ -900,7 +930,7 @@ def summarize_with_llm(items, is_supplement=False):
          "summary": it["summary"][:100],
          "source": it["source"],
          "url": it.get("url", "")}
-        for it in items
+        for it in batch
     ]
 
     supplement_hint = ""
@@ -915,20 +945,82 @@ def summarize_with_llm(items, is_supplement=False):
         + "\n\n" + supplement_hint + LLM_PROMPT_RULES
     )
 
-    log(f"  调用主 LLM: {LLM_MODEL} @ {LLM_BASE_URL} (输入 {len(payload_items)} 条)")
+    log(f"  调用主 LLM: {LLM_MODEL} @ {LLM_BASE_URL} ({tag}输入 {len(payload_items)} 条)")
     result = _call_llm(LLM_BASE_URL, LLM_API_KEY, LLM_MODEL, prompt)
     if result is not None:
-        log(f"  主 LLM 返回 {len(result)} 条")
+        log(f"  主 LLM {tag}返回 {len(result)} 条")
         return result
 
     if LLM_BACKUP_API_KEY and LLM_BACKUP_BASE_URL and LLM_BACKUP_MODEL:
-        log(f"  主模型失败, 切换备用 LLM: {LLM_BACKUP_MODEL} @ {LLM_BACKUP_BASE_URL}")
+        log(f"  主模型{tag}失败, 切换备用 LLM: {LLM_BACKUP_MODEL} @ {LLM_BACKUP_BASE_URL}")
         result = _call_llm(LLM_BACKUP_BASE_URL, LLM_BACKUP_API_KEY, LLM_BACKUP_MODEL, prompt)
         if result is not None:
-            log(f"  备用 LLM 返回 {len(result)} 条")
+            log(f"  备用 LLM {tag}返回 {len(result)} 条")
             return result
 
     return None
+
+
+# 分批大小: 实测单次塞 150+ 条时输出 ~36K 字符 > max_tokens 16000 上限, 被 API
+# 硬截断导致 JSON 永不闭合(2026-09-22~26 连续降级事故根因)。每批 50 条,
+# 输出预估 ~12K 字符, 留足余量; 单批失败只影响本批, 不再拖垮全部条目
+LLM_BATCH_SIZE = 50
+
+
+def _dedup_items(items):
+    """保守去重: 标题归一化全等 或 URL 相同 时保留前者(分批调用后跨批重复兜底)"""
+    seen_titles = set()
+    seen_urls = set()
+    out = []
+    for it in items:
+        t = re.sub(r"\s+", "", (it.get("title") or "")).lower()
+        u = (it.get("url") or "").strip().lower()
+        if (t and t in seen_titles) or (u and u in seen_urls):
+            continue
+        if t:
+            seen_titles.add(t)
+        if u:
+            seen_urls.add(u)
+        out.append(it)
+    dropped = len(items) - len(out)
+    if dropped:
+        log(f"  合并去重: 去掉 {dropped} 条跨批重复")
+    return out
+
+
+def summarize_with_llm(items, is_supplement=False):
+    """调用 LLM 做中文摘要/去重/分级。
+    条目数 ≤ LLM_BATCH_SIZE: 单次调用, 失败返回 None(由外层整体降级)。
+    条目数 > LLM_BATCH_SIZE: 分批调用, 单批失败自动拆半重试, 仍失败仅该子批
+    规则降级, 其余批次不受影响; 永不返回 None。"""
+    if not items:
+        return None
+
+    if len(items) <= LLM_BATCH_SIZE:
+        return _summarize_one_batch(items, is_supplement)
+
+    batches = [items[i:i + LLM_BATCH_SIZE] for i in range(0, len(items), LLM_BATCH_SIZE)]
+    log(f"  输入 {len(items)} 条 > 单批上限 {LLM_BATCH_SIZE}, 分 {len(batches)} 批处理")
+    merged = []
+    for bi, batch in enumerate(batches, 1):
+        tag = f"批{bi}/{len(batches)} "
+        result = _summarize_one_batch(batch, is_supplement, tag)
+        if result is None and len(batch) > 20:
+            # 拆半重试: 输出量减半, 大概率避开截断
+            log(f"  {tag}失败, 拆半重试")
+            half = len(batch) // 2
+            result = []
+            for sub_tag, sub in (("上半", batch[:half]), ("下半", batch[half:])):
+                r = _summarize_one_batch(sub, is_supplement, f"{tag}{sub_tag} ")
+                if r is None:
+                    log(f"  {tag}{sub_tag} 仍失败, 该 {len(sub)} 条规则降级")
+                    r = fallback_format(sub)
+                result.extend(r)
+        if result is None:
+            log(f"  {tag}最终失败, 该 {len(batch)} 条规则降级")
+            result = fallback_format(batch)
+        merged.extend(result)
+    return _dedup_items(merged)
 
 
 def fallback_format(items):
@@ -951,7 +1043,7 @@ def fallback_format(items):
         result.append({
             "title": title,
             "summary": summary[:200],
-            "reason": "AI 智能整理服务暂不可用，本条为原始采集内容（未经翻译与分级），请参阅摘要与来源链接自行判断。",
+            "reason": "该批次 AI 整理未成功，本条为原始采集内容（未经翻译与分级），请参阅摘要与来源链接自行判断。",
             "category": category,
             "priority": "normal",
             "source_label": it["source"] + ("（间接获取）" if it.get("indirect") else ""),
